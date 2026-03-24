@@ -557,9 +557,139 @@ test "functional: heartbeat" {
     var resp = try roundtrip(stream, &req, allocator);
     defer resp.deinit();
 
+    // Heartbeat handler now returns okReply immediately — actual response
+    // is sent asynchronously via HTTP POST to /dataNode/response
     try testing.expectEqual(proto.OP_OK, resp.result_code);
+    try testing.expectEqual(@as(u32, 0), resp.size);
+}
+
+test "functional: create data partition via AdminTask in pkt.data" {
+    const allocator = testing.allocator;
+    var h = try TestHarness.setup();
+    defer h.teardown();
+
+    const stream = try connectClient(h.server_port);
+    defer stream.close();
+
+    // Build AdminTask JSON for CreateDataPartition
+    const admin_task_json =
+        \\{"ID":"test-task-1","OpCode":96,"Request":{"PartitionId":50001,"VolumeId":"testvol","PartitionSize":137438953472,"Hosts":["127.0.0.1:17310"],"ReplicaNum":1}}
+    ;
+
+    var req = Packet{
+        .opcode = proto.OP_CREATE_DATA_PARTITION,
+        .partition_id = 0,
+        .req_id = nextReqId(),
+        .data = admin_task_json,
+        .size = @intCast(admin_task_json.len),
+    };
+    var resp = try roundtrip(stream, &req, allocator);
+    defer resp.deinit();
+
+    try testing.expectEqual(proto.OP_OK, resp.result_code);
+    // Response should contain the disk path
     try testing.expect(resp.size > 0);
-    try testing.expect(resp.data.len > 2); // valid JSON
+
+    // Verify partition was created by reading from it
+    const read_req = Packet{
+        .opcode = proto.OP_GET_PARTITION_SIZE,
+        .partition_id = 50001,
+        .req_id = nextReqId(),
+    };
+    var read_resp = try roundtrip(stream, &read_req, allocator);
+    defer read_resp.deinit();
+    try testing.expectEqual(proto.OP_OK, read_resp.result_code);
+}
+
+test "functional: create data partition with empty data returns error" {
+    const allocator = testing.allocator;
+    var h = try TestHarness.setup();
+    defer h.teardown();
+
+    const stream = try connectClient(h.server_port);
+    defer stream.close();
+
+    // Empty data should return ARG_MISMATCH_ERR
+    const req = Packet{
+        .opcode = proto.OP_CREATE_DATA_PARTITION,
+        .partition_id = 0,
+        .req_id = nextReqId(),
+    };
+    var resp = try roundtrip(stream, &req, allocator);
+    defer resp.deinit();
+
+    try testing.expectEqual(proto.OP_ARG_MISMATCH_ERR, resp.result_code);
+}
+
+test "functional: delete data partition via AdminTask in pkt.data" {
+    const allocator = testing.allocator;
+    var h = try TestHarness.setup();
+    defer h.teardown();
+
+    const stream = try connectClient(h.server_port);
+    defer stream.close();
+
+    // First create a partition
+    const create_json =
+        \\{"ID":"test-task-2","OpCode":96,"Request":{"PartitionId":50002,"VolumeId":"testvol","PartitionSize":1073741824,"Hosts":["127.0.0.1:17310"],"ReplicaNum":1}}
+    ;
+    {
+        var req = Packet{
+            .opcode = proto.OP_CREATE_DATA_PARTITION,
+            .partition_id = 0,
+            .req_id = nextReqId(),
+            .data = create_json,
+            .size = @intCast(create_json.len),
+        };
+        var resp = try roundtrip(stream, &req, allocator);
+        defer resp.deinit();
+        try testing.expectEqual(proto.OP_OK, resp.result_code);
+    }
+
+    // Now delete it via AdminTask in data field
+    const delete_json =
+        \\{"ID":"test-task-3","OpCode":97,"Request":{"PartitionId":50002}}
+    ;
+    {
+        var req = Packet{
+            .opcode = proto.OP_DELETE_DATA_PARTITION,
+            .partition_id = 0,
+            .req_id = nextReqId(),
+            .data = delete_json,
+            .size = @intCast(delete_json.len),
+        };
+        var resp = try roundtrip(stream, &req, allocator);
+        defer resp.deinit();
+        try testing.expectEqual(proto.OP_OK, resp.result_code);
+    }
+}
+
+test "functional: load data partition via AdminTask in pkt.data" {
+    const allocator = testing.allocator;
+    var h = try TestHarness.setup();
+    defer h.teardown();
+
+    const stream = try connectClient(h.server_port);
+    defer stream.close();
+
+    // Load existing test partition using AdminTask in data field
+    const load_json = std.fmt.comptimePrint(
+        "{{\"ID\":\"test-task-4\",\"OpCode\":98,\"Request\":{{\"PartitionId\":{d}}}}}",
+        .{TEST_PARTITION_ID},
+    );
+    var req = Packet{
+        .opcode = proto.OP_LOAD_DATA_PARTITION,
+        .partition_id = 0, // intentionally 0 — should use data field
+        .req_id = nextReqId(),
+        .data = load_json,
+        .size = @intCast(load_json.len),
+    };
+    var resp = try roundtrip(stream, &req, allocator);
+    defer resp.deinit();
+
+    try testing.expectEqual(proto.OP_OK, resp.result_code);
+    // Should return JSON watermarks array
+    try testing.expect(resp.size > 0);
 }
 
 test "functional: partition not found" {
@@ -1291,9 +1421,9 @@ test "functional: heartbeat with qos config" {
     var resp = try roundtrip(stream, &req, allocator);
     defer resp.deinit();
 
+    // Heartbeat handler returns okReply immediately — QoS is parsed from arg
     try testing.expectEqual(proto.OP_OK, resp.result_code);
-    try testing.expect(resp.size > 0);
-    try testing.expect(resp.data.len > 2); // valid JSON response
+    try testing.expectEqual(@as(u32, 0), resp.size);
 }
 
 test "functional: heartbeat response contains partition reports" {
@@ -1320,18 +1450,14 @@ test "functional: heartbeat response contains partition reports" {
         try testing.expectEqual(proto.OP_OK, resp.result_code);
     }
 
-    // Heartbeat — should include partition reports in response
+    // Heartbeat handler now returns okReply immediately — actual heartbeat
+    // data with partition reports is sent via HTTP POST to /dataNode/response
     const req = Packet{ .opcode = proto.OP_DATA_NODE_HEARTBEAT, .partition_id = 0, .req_id = nextReqId() };
     var resp = try roundtrip(stream, &req, allocator);
     defer resp.deinit();
 
     try testing.expectEqual(proto.OP_OK, resp.result_code);
-    try testing.expect(resp.data.len > 10);
-
-    // Verify it contains PartitionReports (JSON)
-    try testing.expect(std.mem.indexOf(u8, resp.data, "PartitionReports") != null or
-        std.mem.indexOf(u8, resp.data, "PartitionID") != null or
-        resp.data.len > 20);
+    try testing.expectEqual(@as(u32, 0), resp.size);
 }
 
 // ──────────────────────────────────────────────────────────────────

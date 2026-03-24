@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 
 const MAX_IDLE_PER_PEER: usize = 4;
 const CONNECT_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
+const IO_TIMEOUT_SECS: u32 = 30; // SO_RCVTIMEO / SO_SNDTIMEO for follower connections
 const IDLE_TIMEOUT_NS: i128 = 30 * std.time.ns_per_s;
 const CLEANUP_INTERVAL_NS: u64 = 10 * std.time.ns_per_s;
 
@@ -110,9 +111,10 @@ pub const ConnPool = struct {
         // Create new connection
         const stream = try connect(addr);
 
-        // Set TCP_NODELAY and keepalive on new connections
+        // Set TCP_NODELAY, keepalive, and I/O timeouts on new connections
         setNoDelay(stream) catch {};
         setKeepalive(stream) catch {};
+        setIoTimeouts(stream) catch {};
 
         return stream;
     }
@@ -241,6 +243,33 @@ pub const ConnPool = struct {
             posix.system.SO.KEEPALIVE,
             &std.mem.toBytes(@as(c_int, 1)),
             @sizeOf(c_int),
+        );
+        if (rc != 0) return error.SetSockOptFailed;
+    }
+
+    fn setIoTimeouts(stream: net.Stream) !void {
+        const fd = stream.handle;
+        const timeval = posix.system.timeval{
+            .sec = @intCast(IO_TIMEOUT_SECS),
+            .usec = 0,
+        };
+        const timeval_bytes = std.mem.asBytes(&timeval);
+        // Set receive timeout
+        var rc = posix.system.setsockopt(
+            fd,
+            posix.system.SOL.SOCKET,
+            posix.system.SO.RCVTIMEO,
+            timeval_bytes,
+            @sizeOf(posix.system.timeval),
+        );
+        if (rc != 0) return error.SetSockOptFailed;
+        // Set send timeout
+        rc = posix.system.setsockopt(
+            fd,
+            posix.system.SOL.SOCKET,
+            posix.system.SO.SNDTIMEO,
+            timeval_bytes,
+            @sizeOf(posix.system.timeval),
         );
         if (rc != 0) return error.SetSockOptFailed;
     }

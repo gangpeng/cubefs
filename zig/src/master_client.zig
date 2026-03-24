@@ -42,7 +42,7 @@ pub const MasterClient = struct {
     /// GET /dataNode/add?addr=ip:port&zoneName=...
     pub fn register(self: *MasterClient) !void {
         var path_buf: [1024]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/dataNode/add?addr={s}:{d}&zoneName={s}&raftHeartbeatPort={d}&raftReplicaPort={d}", .{
+        const path = std.fmt.bufPrint(&path_buf, "/dataNode/add?addr={s}:{d}&zoneName={s}&raftHeartbeatPort={d}&raftReplicaPort={d}&mediaType=1", .{
             self.local_ip,
             self.port,
             self.zone_name,
@@ -126,8 +126,11 @@ pub const MasterClient = struct {
         const port_str = addr[colon + 1 ..];
         const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidAddress;
 
-        const address = try net.Address.parseIp4(host, port);
-        const stream = try net.tcpConnectToAddress(address);
+        // Use tcpConnectToHost which handles both IP addresses and DNS names
+        const stream = net.tcpConnectToHost(self.allocator, host, port) catch |e| {
+            log.warn("TCP connect to {s}:{d} failed: {}", .{ host, port, e });
+            return error.ConnectionRefused;
+        };
         defer stream.close();
 
         // Build request

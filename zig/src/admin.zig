@@ -191,7 +191,7 @@ fn handleDisks(space_mgr: *SpaceManager, allocator: Allocator) ?[]u8 {
     while (i < disk_count) : (i += 1) {
         if (space_mgr.getDisk(i)) |d| {
             list.append(.{
-                .Path = d.path,
+                .DiskPath = d.path,
                 .Total = d.getTotal(),
                 .Used = d.getUsed(),
                 .Available = d.getAvailable(),

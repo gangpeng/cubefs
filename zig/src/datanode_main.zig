@@ -65,7 +65,11 @@ pub fn main() !void {
     }
 
     // Run server (blocks forever)
-    try server_mod.run(config, allocator);
+    server_mod.run(config, allocator) catch |e| {
+        log.err("server failed: {}", .{e});
+        std.debug.print("FATAL: server exited with error: {}\n", .{e});
+        std.process.exit(1);
+    };
 }
 
 fn printUsage() void {

@@ -161,11 +161,12 @@ pub const ReplicationPipeline = struct {
         self.pool.deinit();
     }
 
-    /// Replicate a write to followers using chain replication.
+    /// Replicate an operation to followers using chain replication.
     /// Forwards to the FIRST follower only, passing remaining follower
     /// addresses so each node in the chain forwards to the next.
+    /// Works for writes, create-extent, mark-delete, etc.
     /// Returns a ReplicationResult with the outcome.
-    pub fn replicateWrite(
+    pub fn replicateOp(
         self: *ReplicationPipeline,
         pkt: *const Packet,
         local_result: *Packet,

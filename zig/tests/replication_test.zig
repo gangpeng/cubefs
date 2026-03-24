@@ -100,7 +100,7 @@ test "replication: replicate to unreachable follower reports failure" {
     };
 
     var local_result = Packet.okReply(&pkt);
-    const result = pipeline.replicateWrite(&pkt, &local_result, std.heap.page_allocator);
+    const result = pipeline.replicateOp(&pkt, &local_result, std.heap.page_allocator);
 
     // Forward to unreachable addr should fail
     try testing.expectEqual(@as(usize, 1), result.failure_count);
@@ -126,7 +126,7 @@ test "replication: malformed follower address reports failure" {
     };
 
     var local_result = Packet.okReply(&pkt);
-    const result = pipeline.replicateWrite(&pkt, &local_result, std.heap.page_allocator);
+    const result = pipeline.replicateOp(&pkt, &local_result, std.heap.page_allocator);
 
     try testing.expectEqual(@as(usize, 0), result.success_count);
     try testing.expectEqual(@as(usize, 1), result.failure_count);
@@ -152,7 +152,7 @@ test "replication: replicate with no followers returns ok" {
     };
 
     var local_result = Packet.okReply(&pkt);
-    const result = pipeline.replicateWrite(&pkt, &local_result, std.heap.page_allocator);
+    const result = pipeline.replicateOp(&pkt, &local_result, std.heap.page_allocator);
 
     try testing.expect(result.isOk());
     try testing.expectEqual(@as(usize, 0), result.success_count);
@@ -176,7 +176,7 @@ test "replication: replicate with empty arg returns ok" {
     };
 
     var local_result = Packet.okReply(&pkt);
-    const result = pipeline.replicateWrite(&pkt, &local_result, std.heap.page_allocator);
+    const result = pipeline.replicateOp(&pkt, &local_result, std.heap.page_allocator);
 
     // Empty arg → no follower addresses → no replication
     try testing.expect(result.isOk());
@@ -224,7 +224,7 @@ test "replication: replicate to mock follower succeeds" {
     };
 
     var local_result = Packet.okReply(&pkt);
-    const result = pipeline.replicateWrite(&pkt, &local_result, std.heap.page_allocator);
+    const result = pipeline.replicateOp(&pkt, &local_result, std.heap.page_allocator);
 
     try testing.expectEqual(@as(usize, 1), result.success_count);
     try testing.expect(result.isOk());
@@ -277,7 +277,7 @@ test "replication: follower error reply reports failure" {
     };
 
     var local_result = Packet.okReply(&pkt);
-    const result = pipeline.replicateWrite(&pkt, &local_result, std.heap.page_allocator);
+    const result = pipeline.replicateOp(&pkt, &local_result, std.heap.page_allocator);
 
     try testing.expectEqual(@as(usize, 0), result.success_count);
     try testing.expectEqual(@as(usize, 1), result.failure_count);
@@ -334,7 +334,7 @@ test "replication: CRC is preserved in forwarded packet" {
     };
 
     var local_result = Packet.okReply(&pkt);
-    const result = pipeline.replicateWrite(&pkt, &local_result, std.heap.page_allocator);
+    const result = pipeline.replicateOp(&pkt, &local_result, std.heap.page_allocator);
 
     try testing.expect(result.isOk());
 }

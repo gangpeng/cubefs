@@ -5,6 +5,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 /// AdminTask envelope (matches Go's proto.AdminTask).
+/// Used for parsing incoming admin tasks from the master.
 pub const AdminTask = struct {
     ID: []const u8 = "",
     Type: u8 = 0,
@@ -12,13 +13,30 @@ pub const AdminTask = struct {
     Response: std.json.Value = .null,
 };
 
-/// Disk statistics for heartbeat response.
+/// AdminTask envelope for sending heartbeat responses back to the master.
+/// The master expects to receive the full AdminTask with Response populated.
+pub const HeartbeatTaskResponse = struct {
+    ID: []const u8 = "",
+    PartitionID: u64 = 0,
+    OpCode: u8 = 0,
+    OperatorAddr: []const u8 = "",
+    Status: i8 = 0,
+    SendTime: i64 = 0,
+    CreateTime: i64 = 0,
+    SendCount: u8 = 0,
+    Response: HeartbeatResponse,
+};
+
+/// Disk statistics for heartbeat response (matches Go's proto.DiskStat).
 pub const DiskStat = struct {
-    Path: []const u8,
+    Status: i32 = 0,
+    DiskPath: []const u8,
     Total: u64,
     Used: u64,
     Available: u64,
-    Status: i32,
+    IOUtil: f64 = 0.0,
+    TotalPartitionCnt: i32 = 0,
+    DiskErrPartitionList: []const u64 = &.{},
 };
 
 /// Per-partition report for heartbeat (matches Go's DataPartitionReport).
@@ -42,26 +60,67 @@ pub const HeartbeatResponse = struct {
     Total: u64 = 0,
     Used: u64 = 0,
     Available: u64 = 0,
-    RemainingCapacity: u64 = 0,
     TotalPartitionSize: u64 = 0,
-    CreatedPartitionCnt: u64 = 0,
+    RemainingCapacity: u64 = 0,
+    CreatedPartitionCnt: u32 = 0,
+    MaxCapacity: u64 = 0,
+    StartTime: i64 = 0,
     ZoneName: []const u8 = "",
-    PartitionReports: []DataPartitionReport = &.{},
-    DiskStats: []DiskStat = &.{},
+    PartitionReports: []const DataPartitionReport = &.{},
     Status: u8 = 0,
     Result: []const u8 = "",
+    AllDisks: []const []const u8 = &.{},
+    DiskStats: []const DiskStat = &.{},
     BadDisks: []const []const u8 = &.{},
-    StartTime: i64 = 0,
     CpuUtil: f64 = 0.0,
 };
 
 /// CreateDataPartition request parsed from AdminTask.
+/// Field names must match Go's proto.CreateDataPartitionRequest.
 pub const CreatePartitionRequest = struct {
     PartitionId: u64 = 0,
-    VolumeId: u64 = 0,
-    PartitionSize: u64 = 0,
-    Replicas: [][]const u8 = &.{},
-    CreateType: u8 = 0,
+    VolumeId: []const u8 = "",
+    PartitionSize: i64 = 0,
+    ReplicaNum: i64 = 0,
+    Hosts: []const []const u8 = &.{},
+    CreateType: i64 = 0,
+    PartitionTyp: i64 = 0,
+    IsRandomWrite: bool = false,
+    LeaderSize: i64 = 0,
+};
+
+/// AdminTask wrapper for CreateDataPartition — allows direct parsing
+/// of the nested Request field as a CreatePartitionRequest.
+pub const CreatePartitionTask = struct {
+    ID: []const u8 = "",
+    OpCode: u8 = 0,
+    Request: CreatePartitionRequest = .{},
+};
+
+/// DeleteDataPartition request parsed from AdminTask.
+pub const DeletePartitionRequest = struct {
+    PartitionId: u64 = 0,
+    PartitionSize: i64 = 0,
+    Force: bool = false,
+};
+
+/// AdminTask wrapper for DeleteDataPartition.
+pub const DeletePartitionTask = struct {
+    ID: []const u8 = "",
+    OpCode: u8 = 0,
+    Request: DeletePartitionRequest = .{},
+};
+
+/// LoadDataPartition request parsed from AdminTask.
+pub const LoadPartitionReq = struct {
+    PartitionId: u64 = 0,
+};
+
+/// AdminTask wrapper for LoadDataPartition.
+pub const LoadPartitionTask = struct {
+    ID: []const u8 = "",
+    OpCode: u8 = 0,
+    Request: LoadPartitionReq = .{},
 };
 
 /// Watermark info for load partition response.
@@ -163,7 +222,7 @@ test "parseAdminTask with minimal JSON" {
 test "stringify and parse round-trip for DiskStat" {
     const allocator = testing.allocator;
     const stat = DiskStat{
-        .Path = "/data1",
+        .DiskPath = "/data1",
         .Total = 1_000_000_000,
         .Used = 500_000_000,
         .Available = 500_000_000,
@@ -186,7 +245,7 @@ test "stringify and parse round-trip for DiskStat" {
 
 test "parse CreatePartitionRequest" {
     const allocator = testing.allocator;
-    const json_str = "{\"PartitionId\":1001,\"VolumeId\":5,\"PartitionSize\":137438953472}";
+    const json_str = "{\"PartitionId\":1001,\"VolumeId\":\"vol-5\",\"PartitionSize\":137438953472,\"Hosts\":[\"10.0.0.1:17310\",\"10.0.0.2:17310\"]}";
 
     const parsed = std.json.parseFromSlice(CreatePartitionRequest, allocator, json_str, .{
         .ignore_unknown_fields = true,
@@ -195,8 +254,59 @@ test "parse CreatePartitionRequest" {
     const req = parsed.value;
 
     try testing.expectEqual(@as(u64, 1001), req.PartitionId);
-    try testing.expectEqual(@as(u64, 5), req.VolumeId);
-    try testing.expectEqual(@as(u64, 137438953472), req.PartitionSize);
+    try testing.expectEqualStrings("vol-5", req.VolumeId);
+    try testing.expectEqual(@as(i64, 137438953472), req.PartitionSize);
+    try testing.expectEqual(@as(usize, 2), req.Hosts.len);
+    try testing.expectEqualStrings("10.0.0.1:17310", req.Hosts[0]);
+}
+
+test "parse CreatePartitionTask (AdminTask wrapper)" {
+    const allocator = testing.allocator;
+    const json_str =
+        \\{"ID":"task-42","OpCode":96,"Request":{"PartitionId":2001,"VolumeId":"benchvol","PartitionSize":137438953472,"Hosts":["10.0.0.1:17310","10.0.0.2:17310","10.0.0.3:17310"],"ReplicaNum":3}}
+    ;
+
+    const parsed = std.json.parseFromSlice(CreatePartitionTask, allocator, json_str, .{
+        .ignore_unknown_fields = true,
+    }) catch |e| return e;
+    defer parsed.deinit();
+    const task = parsed.value;
+
+    try testing.expectEqualStrings("task-42", task.ID);
+    try testing.expectEqual(@as(u8, 96), task.OpCode);
+    try testing.expectEqual(@as(u64, 2001), task.Request.PartitionId);
+    try testing.expectEqualStrings("benchvol", task.Request.VolumeId);
+    try testing.expectEqual(@as(i64, 3), task.Request.ReplicaNum);
+    try testing.expectEqual(@as(usize, 3), task.Request.Hosts.len);
+}
+
+test "parse DeletePartitionTask (AdminTask wrapper)" {
+    const allocator = testing.allocator;
+    const json_str =
+        \\{"ID":"task-99","OpCode":97,"Request":{"PartitionId":3001,"Force":true}}
+    ;
+
+    const parsed = std.json.parseFromSlice(DeletePartitionTask, allocator, json_str, .{
+        .ignore_unknown_fields = true,
+    }) catch |e| return e;
+    defer parsed.deinit();
+
+    try testing.expectEqual(@as(u64, 3001), parsed.value.Request.PartitionId);
+    try testing.expect(parsed.value.Request.Force);
+}
+
+test "parse LoadPartitionTask (AdminTask wrapper)" {
+    const allocator = testing.allocator;
+    const json_str =
+        \\{"ID":"task-55","OpCode":98,"Request":{"PartitionId":4001}}
+    ;
+
+    const parsed = std.json.parseFromSlice(LoadPartitionTask, allocator, json_str, .{
+        .ignore_unknown_fields = true,
+    }) catch |e| return e;
+    defer parsed.deinit();
+
+    try testing.expectEqual(@as(u64, 4001), parsed.value.Request.PartitionId);
 }
 
 test "parse ignores unknown fields" {

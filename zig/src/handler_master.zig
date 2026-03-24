@@ -17,20 +17,28 @@ const DataPartition = partition_mod.DataPartition;
 const RaftServer = raft_server_mod.RaftServer;
 
 /// Handle OpCreateDataPartition
+/// The master sends an AdminTask JSON in pkt.data containing a nested
+/// Request field with the CreateDataPartitionRequest.
 pub fn handleCreateDataPartition(
     pkt: *const Packet,
     space_mgr: *SpaceManager,
     raft_server: ?*RaftServer,
     allocator: Allocator,
 ) Packet {
-    // Parse AdminTask from arg
-    if (pkt.arg.len == 0) {
+    // Parse AdminTask wrapper from data (not arg)
+    if (pkt.data.len == 0) {
+        log.warn("CreateDataPartition: empty data field", .{});
         return Packet.errReply(pkt, proto.OP_ARG_MISMATCH_ERR);
     }
 
-    const req = json_mod.parse(json_mod.CreatePartitionRequest, allocator, pkt.arg) catch {
+    const parsed = std.json.parseFromSlice(json_mod.CreatePartitionTask, allocator, pkt.data, .{
+        .ignore_unknown_fields = true,
+    }) catch |e| {
+        log.warn("CreateDataPartition: failed to parse AdminTask from data: {}", .{e});
         return Packet.errReply(pkt, proto.OP_ARG_MISMATCH_ERR);
     };
+    defer parsed.deinit();
+    const req = parsed.value.Request;
 
     // Select disk with most space
     const d = space_mgr.selectDisk() orelse {
@@ -50,9 +58,9 @@ pub fn handleCreateDataPartition(
     const dp = DataPartition.init(
         allocator,
         req.PartitionId,
-        req.VolumeId,
+        0, // volume_id not used for numeric storage
         data_path,
-        req.Replicas,
+        req.Hosts,
         d,
     ) catch {
         allocator.free(data_path);
@@ -60,7 +68,7 @@ pub fn handleCreateDataPartition(
     };
 
     if (req.PartitionSize > 0) {
-        dp.setSize(req.PartitionSize);
+        dp.setSize(@intCast(req.PartitionSize));
     }
 
     // Start raft for this partition
@@ -73,19 +81,40 @@ pub fn handleCreateDataPartition(
     space_mgr.addPartition(dp);
     log.info("created partition {d} on disk {s}", .{ req.PartitionId, d.path });
 
-    return Packet.okReply(pkt);
+    // Go DataNode returns the disk path in the response body
+    var reply = Packet.okReply(pkt);
+    const path_copy = allocator.dupe(u8, d.path) catch {
+        return reply;
+    };
+    reply.data = path_copy;
+    reply.data_owned = true;
+    reply.allocator = allocator;
+    reply.size = @intCast(path_copy.len);
+    return reply;
 }
 
 /// Handle OpDeleteDataPartition
+/// The master sends an AdminTask JSON in pkt.data containing a nested
+/// Request field with the DeleteDataPartitionRequest.
 pub fn handleDeleteDataPartition(
     pkt: *const Packet,
     space_mgr: *SpaceManager,
     allocator: Allocator,
 ) Packet {
-    const partition_id = pkt.partition_id;
+    // Parse AdminTask from data field
+    var partition_id = pkt.partition_id;
+    if (pkt.data.len > 0) {
+        const parsed = std.json.parseFromSlice(json_mod.DeletePartitionTask, allocator, pkt.data, .{
+            .ignore_unknown_fields = true,
+        }) catch |e| {
+            log.warn("DeleteDataPartition: failed to parse AdminTask: {}", .{e});
+            return Packet.errReply(pkt, proto.OP_ARG_MISMATCH_ERR);
+        };
+        defer parsed.deinit();
+        partition_id = parsed.value.Request.PartitionId;
+    }
 
     if (space_mgr.removePartition(partition_id)) |dp| {
-        // Delete directory
         const path_str = dp.data_path;
         std.fs.cwd().deleteTree(path_str) catch {};
         dp.deinit();
@@ -93,17 +122,34 @@ pub fn handleDeleteDataPartition(
         return Packet.okReply(pkt);
     }
 
-    _ = allocator;
     return Packet.errReply(pkt, proto.OP_NOT_EXIST_ERR);
 }
 
-/// Handle OpLoadDataPartition — return watermarks for an existing partition
+/// Handle OpLoadDataPartition — return watermarks for an existing partition.
+/// The master sends an AdminTask JSON in pkt.data; the Go DataNode
+/// responds with PacketOkReply immediately, then loads asynchronously.
+/// For simplicity we load synchronously and return the watermarks.
 pub fn handleLoadDataPartition(
     pkt: *const Packet,
     space_mgr: *SpaceManager,
     allocator: Allocator,
 ) Packet {
-    const dp = space_mgr.getPartition(pkt.partition_id) orelse {
+    // Parse AdminTask from data field to get partition_id
+    var partition_id = pkt.partition_id;
+    if (pkt.data.len > 0) {
+        if (std.json.parseFromSlice(json_mod.LoadPartitionTask, allocator, pkt.data, .{
+            .ignore_unknown_fields = true,
+        })) |parsed| {
+            if (parsed.value.Request.PartitionId != 0) {
+                partition_id = parsed.value.Request.PartitionId;
+            }
+            parsed.deinit();
+        } else |_| {
+            // Fall back to packet header partition_id
+        }
+    }
+
+    const dp = space_mgr.getPartition(partition_id) orelse {
         return Packet.errReply(pkt, proto.OP_NOT_EXIST_ERR);
     };
 
@@ -137,6 +183,10 @@ pub fn handleLoadDataPartition(
 }
 
 /// Handle OpDataNodeHeartbeat
+/// The Go master sends heartbeat requests via binary protocol. The DataNode
+/// should reply with okReply immediately — the actual heartbeat response data
+/// is sent asynchronously via HTTP POST to /dataNode/response by the
+/// heartbeat loop in server.zig.
 pub fn handleHeartbeat(
     pkt: *const Packet,
     space_mgr: *SpaceManager,
@@ -147,73 +197,7 @@ pub fn handleHeartbeat(
         applyHeartbeatQos(pkt.arg, space_mgr, allocator);
     }
 
-    // Build heartbeat response with disk stats and partition reports
-    var total_space: u64 = 0;
-    var total_used: u64 = 0;
-    var total_avail: u64 = 0;
-
-    // Disk stats
-    const disk_count = space_mgr.diskCount();
-    var disk_stats = std.ArrayList(json_mod.DiskStat).init(allocator);
-    defer disk_stats.deinit();
-
-    var i: usize = 0;
-    while (i < disk_count) : (i += 1) {
-        if (space_mgr.getDisk(i)) |d| {
-            d.updateSpace() catch {};
-            const t = d.getTotal();
-            const u = d.getUsed();
-            const a = d.getAvailable();
-            total_space += t;
-            total_used += u;
-            total_avail += a;
-            disk_stats.append(.{
-                .Path = d.path,
-                .Total = t,
-                .Used = u,
-                .Available = a,
-                .Status = d.status.load(.acquire),
-            }) catch {};
-        }
-    }
-
-    // Partition reports
-    const partitions = space_mgr.allPartitions(allocator) catch {
-        return Packet.errReply(pkt, proto.OP_ERR);
-    };
-    defer allocator.free(partitions);
-
-    var reports = std.ArrayList(json_mod.PartitionReport).init(allocator);
-    defer reports.deinit();
-
-    for (partitions) |dp| {
-        reports.append(.{
-            .PartitionID = dp.partition_id,
-            .PartitionStatus = dp.getStatus(),
-            .Total = dp.getSize(),
-            .Used = dp.usedSize(),
-            .ExtentCount = @intCast(dp.extentCount()),
-        }) catch {};
-    }
-
-    const resp = json_mod.HeartbeatResponse{
-        .Total = total_space,
-        .Used = total_used,
-        .Available = total_avail,
-        .PartitionReports = reports.items,
-        .DiskStats = disk_stats.items,
-    };
-
-    const json_data = json_mod.stringify(allocator, resp) catch {
-        return Packet.errReply(pkt, proto.OP_ERR);
-    };
-
-    var reply = Packet.okReply(pkt);
-    reply.data = json_data;
-    reply.data_owned = true;
-    reply.allocator = allocator;
-    reply.size = @intCast(json_data.len);
-    return reply;
+    return Packet.okReply(pkt);
 }
 
 /// Parse QoS limits from heartbeat request arg and apply to all disks.

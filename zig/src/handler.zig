@@ -52,7 +52,7 @@ pub const ServerInner = struct {
     pub fn dispatch(self: *ServerInner, pkt: *const Packet) Packet {
         return switch (pkt.opcode) {
             // ── I/O operations ────────────────────────────────────
-            proto.OP_CREATE_EXTENT => self.withPartition(pkt, handler_io.handleCreateExtent),
+            proto.OP_CREATE_EXTENT => self.handleOpWithReplication(pkt, handler_io.handleCreateExtent),
             proto.OP_WRITE, proto.OP_SYNC_WRITE => self.handleWriteWithReplication(pkt),
             proto.OP_RANDOM_WRITE,
             proto.OP_SYNC_RANDOM_WRITE,
@@ -65,7 +65,7 @@ pub const ServerInner = struct {
             => self.handleWriteWithReplication(pkt),
             proto.OP_READ => self.withPartition(pkt, handler_io.handleRead),
             proto.OP_STREAM_READ, proto.OP_STREAM_FOLLOWER_READ => self.withPartition(pkt, handler_io.handleStreamRead),
-            proto.OP_MARK_DELETE => self.withPartition(pkt, handler_io.handleMarkDelete),
+            proto.OP_MARK_DELETE => self.handleOpWithReplication(pkt, handler_io.handleMarkDelete),
             proto.OP_GET_ALL_WATERMARKS => self.withPartition(pkt, handler_io.handleGetWatermarks),
             proto.OP_GET_APPLIED_ID => self.withPartition(pkt, handler_io.handleGetAppliedId),
             proto.OP_GET_PARTITION_SIZE => self.withPartition(pkt, handler_io.handleGetPartitionSize),
@@ -138,13 +138,43 @@ pub const ServerInner = struct {
 
         // Forward to followers if needed
         if (pkt.isForward()) {
-            const repl_result = self.replication.replicateWrite(pkt, &local_result, self.allocator);
+            const repl_result = self.replication.replicateOp(pkt, &local_result, self.allocator);
 
             // If local write succeeded but replication had failures, log it
             // but still return the local result (leader succeeds)
             if (!repl_result.isOk() and local_result.result_code == proto.OP_OK) {
                 log.warn("replication partial failure for req_id={d}: {d}/{d} followers failed", .{
                     pkt.req_id,
+                    repl_result.failure_count,
+                    repl_result.failure_count + repl_result.success_count,
+                });
+            }
+        }
+
+        return local_result;
+    }
+
+    /// Handle any opcode with optional replication (create extent, mark delete, etc.).
+    /// Executes the local handler, then forwards to followers if needed.
+    fn handleOpWithReplication(
+        self: *ServerInner,
+        pkt: *const Packet,
+        handler: fn (*const Packet, *DataPartition, Allocator) Packet,
+    ) Packet {
+        const dp = self.space_mgr.getPartition(pkt.partition_id) orelse {
+            return Packet.errReply(pkt, proto.OP_NOT_EXIST_ERR);
+        };
+
+        var local_result = handler(pkt, dp, self.allocator);
+
+        // Forward to followers if needed
+        if (pkt.isForward()) {
+            const repl_result = self.replication.replicateOp(pkt, &local_result, self.allocator);
+
+            if (!repl_result.isOk() and local_result.result_code == proto.OP_OK) {
+                log.warn("replication partial failure for req_id={d} op=0x{x:0>2}: {d}/{d} followers failed", .{
+                    pkt.req_id,
+                    pkt.opcode,
                     repl_result.failure_count,
                     repl_result.failure_count + repl_result.success_count,
                 });

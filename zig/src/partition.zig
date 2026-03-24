@@ -32,7 +32,7 @@ pub const DataPartition = struct {
     volume_id: u64,
     partition_size: std.atomic.Value(u64),
     store: *ExtentStore,
-    replicas: [][]const u8,
+    replicas: []const []const u8,
     applied_id: std.atomic.Value(u64),
     status: std.atomic.Value(i32),
     disk: *Disk,
@@ -52,7 +52,7 @@ pub const DataPartition = struct {
         partition_id: u64,
         volume_id: u64,
         data_path: [:0]const u8,
-        replicas: [][]const u8,
+        replicas: []const []const u8,
         disk: *Disk,
     ) !*DataPartition {
         const store = ExtentStore.create(allocator, data_path, partition_id) catch {
@@ -90,7 +90,7 @@ pub const DataPartition = struct {
         partition_id: u64,
         volume_id: u64,
         data_path: [:0]const u8,
-        replicas: [][]const u8,
+        replicas: []const []const u8,
         disk: *Disk,
     ) !*DataPartition {
         return init(allocator, partition_id, volume_id, data_path, replicas, disk);

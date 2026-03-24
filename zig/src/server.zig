@@ -14,6 +14,7 @@ const connection_mod = @import("connection.zig");
 const admin_mod = @import("admin.zig");
 const json_mod = @import("json.zig");
 const raft_server_mod = @import("raft/server.zig");
+const proto = @import("protocol.zig");
 const log = @import("log.zig");
 const Config = config_mod.Config;
 const Disk = disk_mod.Disk;
@@ -24,7 +25,7 @@ const ServerInner = handler_mod.ServerInner;
 const RaftServer = raft_server_mod.RaftServer;
 
 const SEND_BUFFER_SIZE: u32 = 1024 * 1024; // 1 MB
-const HEARTBEAT_INTERVAL_NS: u64 = 30 * std.time.ns_per_s;
+const HEARTBEAT_INTERVAL_NS: u64 = 10 * std.time.ns_per_s;
 
 /// Context passed to background threads that need server state.
 const HeartbeatContext = struct {
@@ -32,6 +33,8 @@ const HeartbeatContext = struct {
     space_mgr: *SpaceManager,
     start_time: i64,
     zone_name: []const u8,
+    local_addr: []const u8,
+    port: u16,
     allocator: Allocator,
 };
 
@@ -134,6 +137,8 @@ pub fn run(config: Config, allocator: Allocator) !void {
             .space_mgr = &space_mgr,
             .start_time = start_time,
             .zone_name = config.zone_name,
+            .local_addr = config.local_ip,
+            .port = config.port,
             .allocator = allocator,
         };
         _ = std.Thread.spawn(.{}, heartbeatLoop, .{ctx}) catch |e| {
@@ -210,6 +215,9 @@ fn buildHeartbeatBody(ctx: *HeartbeatContext) ![]u8 {
     var disk_stats = std.ArrayList(json_mod.DiskStat).init(allocator);
     defer disk_stats.deinit();
 
+    var all_disks = std.ArrayList([]const u8).init(allocator);
+    defer all_disks.deinit();
+
     var total_space: u64 = 0;
     var total_used: u64 = 0;
     var total_available: u64 = 0;
@@ -229,8 +237,10 @@ fn buildHeartbeatBody(ctx: *HeartbeatContext) ![]u8 {
             total_used += du;
             total_available += da;
 
+            try all_disks.append(d.path);
+
             try disk_stats.append(.{
-                .Path = d.path,
+                .DiskPath = d.path,
                 .Total = dt,
                 .Used = du,
                 .Available = da,
@@ -266,21 +276,38 @@ fn buildHeartbeatBody(ctx: *HeartbeatContext) ![]u8 {
         });
     }
 
+    // Build operator address: "ip:port"
+    var addr_buf: [256]u8 = undefined;
+    const operator_addr = std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ ctx.local_addr, ctx.port }) catch "unknown";
+
     const heartbeat = json_mod.HeartbeatResponse{
         .Total = total_space,
         .Used = total_used,
         .Available = total_available,
         .RemainingCapacity = total_available,
+        .MaxCapacity = total_available,
         .TotalPartitionSize = total_partition_size,
         .CreatedPartitionCnt = @intCast(partitions.len),
         .ZoneName = ctx.zone_name,
         .PartitionReports = reports.items,
+        .AllDisks = all_disks.items,
         .DiskStats = disk_stats.items,
+        .BadDisks = bad_disks.items,
         .StartTime = ctx.start_time,
+        .Status = 1, // TaskSucceeds
         .Result = "success",
     };
 
-    return try json_mod.stringify(allocator, heartbeat);
+    // Wrap in AdminTask envelope — the master expects this format
+    const task_resp = json_mod.HeartbeatTaskResponse{
+        .OpCode = proto.OP_DATA_NODE_HEARTBEAT,
+        .OperatorAddr = operator_addr,
+        .Status = 1, // TaskSucceeds
+        .SendTime = std.time.timestamp(),
+        .Response = heartbeat,
+    };
+
+    return try json_mod.stringify(allocator, task_resp);
 }
 
 fn setNoDelay(stream: net.Stream) !void {
