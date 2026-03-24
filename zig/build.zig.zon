@@ -1,0 +1,13 @@
+.{
+    .name = .cubefs_engine_zig,
+    .version = "0.1.0",
+    .fingerprint = 0x114f8c8d46137bcc,
+    .minimum_zig_version = "0.14.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "cubefs_engine.h",
+    },
+}
