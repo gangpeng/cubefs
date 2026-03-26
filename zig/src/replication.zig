@@ -15,6 +15,7 @@ const ConnPool = conn_pool_mod.ConnPool;
 const WORKER_COUNT: usize = 16;
 const MAX_QUEUE_SIZE: usize = 256;
 const MAX_FOLLOWERS: usize = 8;
+const REPLICATION_TIMEOUT_NS: u64 = 10 * std.time.ns_per_s;
 
 /// Result of a replication operation across followers.
 pub const ReplicationResult = struct {
@@ -209,8 +210,17 @@ pub const ReplicationPipeline = struct {
             return repl_result;
         }
 
-        // Wait for completion
-        event.wait();
+        // Wait for completion with timeout to avoid blocking the handler thread forever
+        event.timedWait(REPLICATION_TIMEOUT_NS) catch {
+            log.warn("replication timeout for req_id={d} to {s}", .{ pkt.req_id, addrs[0] });
+            repl_result.errors[0] = .{
+                .follower_idx = 0,
+                .addr = addrs[0],
+                .kind = .recv_failed,
+            };
+            repl_result.failure_count = 1;
+            return repl_result;
+        };
 
         if (result) {
             repl_result.success_count = 1;
