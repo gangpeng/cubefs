@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const posix = std.posix;
 const proto = @import("protocol.zig");
 const pkt_mod = @import("packet.zig");
 const Packet = pkt_mod.Packet;
@@ -55,11 +56,10 @@ pub fn readPacket(reader: anytype, allocator: Allocator) !Packet {
 
     // 3. Determine wire data size
     // Read requests carry 0 data bytes on wire (size field = desired read length).
-    // Write responses carry 0 data bytes on wire (size field echoes the request).
-    const is_response = (packet.result_code != proto.OP_INIT_RESULT_CODE);
+    // Write responses: the Go protocol always reads Size bytes from the wire,
+    // so the sender must set Size=0 if no data follows. We do NOT skip data
+    // for write responses here — we trust the Size field to reflect wire reality.
     const wire_data_size: u32 = if (packet.isReadRequest())
-        0
-    else if (is_response and proto.isWriteOperation(packet.opcode))
         0
     else
         packet.size;
@@ -130,6 +130,80 @@ pub fn writePacketFlush(writer: anytype, packet: *const Packet) !void {
     // If the writer supports flush (e.g. BufferedWriter), flush it.
     if (@hasDecl(@TypeOf(writer), "flush")) {
         try writer.flush();
+    }
+}
+
+/// Write one complete packet to a socket fd using writev (scatter-gather I/O).
+/// Sends header + extra + arg + data in a single syscall, reducing overhead
+/// for large read responses (e.g. 1MB seq_read) where multiple write() calls
+/// cause unnecessary kernel transitions and TCP segmentation delays.
+pub fn writePacketFd(fd: posix.fd_t, packet: *const Packet) !void {
+    // Marshal header and extra fields into stack buffers.
+    var hdr_buf: [proto.PACKET_HEADER_SIZE]u8 = undefined;
+    packet.marshalHeader(&hdr_buf);
+
+    var extra_buf: [12]u8 = undefined;
+    const extra_len = proto.extraHeaderLen(packet.extent_type);
+    if (extra_len > 0) {
+        packet.marshalExtraFields(extra_buf[0..extra_len]);
+    }
+
+    // Build iovec array (up to 4 segments).
+    var iovecs: [4]posix.iovec_const = undefined;
+    var iov_count: usize = 0;
+
+    // Segment 1: base header (always present)
+    iovecs[iov_count] = .{ .base = &hdr_buf, .len = proto.PACKET_HEADER_SIZE };
+    iov_count += 1;
+
+    // Segment 2: extra header fields (optional)
+    if (extra_len > 0) {
+        iovecs[iov_count] = .{ .base = &extra_buf, .len = extra_len };
+        iov_count += 1;
+    }
+
+    // Segment 3: arg (optional)
+    if (packet.arg.len > 0) {
+        iovecs[iov_count] = .{ .base = packet.arg.ptr, .len = packet.arg.len };
+        iov_count += 1;
+    }
+
+    // Segment 4: data (optional)
+    if (packet.data.len > 0) {
+        iovecs[iov_count] = .{ .base = packet.data.ptr, .len = packet.data.len };
+        iov_count += 1;
+    }
+
+    // Compute total bytes to send.
+    var total: usize = 0;
+    for (iovecs[0..iov_count]) |v| {
+        total += v.len;
+    }
+
+    // writev loop: advance through iovec segments as data is sent.
+    var sent: usize = 0;
+    var cur_iov: usize = 0;
+    while (sent < total) {
+        const n = posix.writev(fd, iovecs[cur_iov..iov_count]) catch |err| {
+            return switch (err) {
+                error.ConnectionResetByPeer, error.BrokenPipe => error.ConnectionClosed,
+                else => error.InputOutput,
+            };
+        };
+        if (n == 0) return error.ConnectionClosed;
+        sent += n;
+
+        // Advance past fully-sent iovec segments.
+        var skip: usize = n;
+        while (cur_iov < iov_count and skip >= iovecs[cur_iov].len) {
+            skip -= iovecs[cur_iov].len;
+            cur_iov += 1;
+        }
+        // Adjust partial segment.
+        if (cur_iov < iov_count and skip > 0) {
+            iovecs[cur_iov].base += skip;
+            iovecs[cur_iov].len -= skip;
+        }
     }
 }
 

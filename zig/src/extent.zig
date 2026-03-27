@@ -72,6 +72,9 @@ pub const Extent = struct {
             return error.IoError;
         };
 
+        // Hint kernel for sequential readahead on the read FD.
+        _ = std.os.linux.fadvise(read_fd, 0, 0, std.os.linux.POSIX_FADV.SEQUENTIAL);
+
         const now = @as(i64, @intCast(std.time.timestamp()));
 
         const self = allocator.create(Extent) catch return error.IoError;
@@ -107,6 +110,9 @@ pub const Extent = struct {
             posix.close(write_fd);
             return error.IoError;
         };
+
+        // Hint kernel for sequential readahead on the read FD.
+        _ = std.os.linux.fadvise(read_fd, 0, 0, std.os.linux.POSIX_FADV.SEQUENTIAL);
 
         // Get file size via fstat
         const stat = posix.fstat(write_fd) catch {

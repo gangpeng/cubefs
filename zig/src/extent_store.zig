@@ -73,17 +73,18 @@ pub const ExtentStore = struct {
     /// Latest raft apply ID.
     apply_id: std.atomic.Value(u64),
     /// Serializes extent access against lifecycle changes and cache eviction.
-    extent_lifecycle_lock: std.Thread.Mutex,
+    /// Read operations use lockShared(); lifecycle-mutating operations use lock().
+    extent_lifecycle_lock: std.Thread.RwLock,
     /// Serializes cache-miss open/insert so only one handle is created per extent.
     extent_open_mu: std.Thread.Mutex,
-    /// Guards operation entry/exit accounting for close and destroy.
+    /// Guards the drain wait in close/destroy.
     op_mu: std.Thread.Mutex,
-    /// Notifies close/destroy when in-flight operations drain.
+    /// Notifies close/destroy when in-flight operations drain to zero.
     op_cv: std.Thread.Condition,
-    /// Number of extent operations that have entered but not yet exited.
-    active_ops: usize,
+    /// Number of extent operations that have entered but not yet exited (atomic).
+    active_ops: std.atomic.Value(u32),
     /// Whether destroy has started and new operations must be rejected.
-    destroying: bool,
+    destroying: std.atomic.Value(bool),
     /// CRC persistence (optional, null until initialized).
     crc_persistence: ?crc_persist_mod.CrcPersistence,
     /// Tiny delete recorder (optional, null until initialized).
@@ -113,12 +114,12 @@ pub const ExtentStore = struct {
             .partition_id = partition_id,
             .closed = std.atomic.Value(bool).init(false),
             .apply_id = std.atomic.Value(u64).init(0),
-            .extent_lifecycle_lock = .{},
+            .extent_lifecycle_lock = .{},  // RwLock default init
             .extent_open_mu = .{},
             .op_mu = .{},
             .op_cv = .{},
-            .active_ops = 0,
-            .destroying = false,
+            .active_ops = std.atomic.Value(u32).init(0),
+            .destroying = std.atomic.Value(bool).init(false),
             .crc_persistence = null,
             .tiny_delete_recorder = null,
             .extent_lock_map = std.AutoHashMap(u64, GcFlag).init(allocator),
@@ -145,15 +146,18 @@ pub const ExtentStore = struct {
 
     /// Destroy the extent store, freeing all resources.
     pub fn destroy(self: *ExtentStore) void {
-        self.op_mu.lock();
-        self.destroying = true;
+        // Signal that we are destroying — reject new operations atomically.
+        self.destroying.store(true, .release);
         self.closed.store(true, .release);
-        while (self.active_ops != 0) {
+
+        // Wait for in-flight operations to drain.
+        self.op_mu.lock();
+        while (self.active_ops.load(.acquire) != 0) {
             self.op_cv.wait(&self.op_mu);
         }
         self.op_mu.unlock();
 
-        self.extent_lifecycle_lock.lock();
+        self.extent_lifecycle_lock.lock();  // exclusive — destroying
 
         self.cache.clear();
         self.cache.deinit();
@@ -169,24 +173,32 @@ pub const ExtentStore = struct {
     }
 
     fn beginOp(self: *ExtentStore) err.Error!void {
-        self.op_mu.lock();
-        defer self.op_mu.unlock();
-
-        if (self.destroying or self.closed.load(.acquire)) {
+        // Atomically check destroying/closed and increment active_ops.
+        // No mutex needed on the hot path — only the drain path uses op_mu.
+        if (self.destroying.load(.acquire) or self.closed.load(.acquire)) {
             return error.ExtentDeleted;
         }
-
-        self.active_ops += 1;
+        _ = self.active_ops.fetchAdd(1, .acq_rel);
+        // Re-check after increment to close the race with destroy/close.
+        if (self.destroying.load(.acquire) or self.closed.load(.acquire)) {
+            self.decrementOps();
+            return error.ExtentDeleted;
+        }
     }
 
     fn endOp(self: *ExtentStore) void {
-        self.op_mu.lock();
-        defer self.op_mu.unlock();
+        self.decrementOps();
+    }
 
-        std.debug.assert(self.active_ops > 0);
-        self.active_ops -= 1;
-        if (self.active_ops == 0) {
+    /// Decrement active_ops and wake drain waiters if it reaches zero.
+    fn decrementOps(self: *ExtentStore) void {
+        const prev = self.active_ops.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
+        if (prev == 1) {
+            // Was the last op — wake any draining thread.
+            self.op_mu.lock();
             self.op_cv.broadcast();
+            self.op_mu.unlock();
         }
     }
 
@@ -199,7 +211,7 @@ pub const ExtentStore = struct {
         try self.beginOp();
         defer self.endOp();
 
-        self.extent_lifecycle_lock.lock();
+        self.extent_lifecycle_lock.lock();  // exclusive — lifecycle mutation
         defer self.extent_lifecycle_lock.unlock();
 
         if (self.closed.load(.acquire)) {
@@ -242,10 +254,11 @@ pub const ExtentStore = struct {
         try self.beginOp();
         defer self.endOp();
 
-        self.extent_lifecycle_lock.lock();
-        defer self.extent_lifecycle_lock.unlock();
+        // Phase 1 (shared lock): closed check → GC lock check → getOrOpenExtent → ext.write → read modify_time
+        self.extent_lifecycle_lock.lockShared();  // shared — ext.write() has its own per-extent write_mutex
 
         if (self.closed.load(.acquire)) {
+            self.extent_lifecycle_lock.unlockShared();
             return error.ExtentDeleted;
         }
 
@@ -255,16 +268,28 @@ pub const ExtentStore = struct {
             const flag = self.extent_lock_map.get(param.extent_id);
             self.lock_mu.unlock();
             if (flag) |f| {
-                if (f == .gc_delete) return error.ExtentLocked;
+                if (f == .gc_delete) {
+                    self.extent_lifecycle_lock.unlockShared();
+                    return error.ExtentLocked;
+                }
             }
         }
 
         // getOrOpenExtent will return ExtentNotFound if the extent doesn't exist,
         // so no need for a separate contains() check.
-        const ext = try self.getOrOpenExtent(param.extent_id);
-        _ = try ext.write(param);
+        const ext = self.getOrOpenExtent(param.extent_id) catch |e| {
+            self.extent_lifecycle_lock.unlockShared();
+            return e;
+        };
+        _ = ext.write(param) catch |e| {
+            self.extent_lifecycle_lock.unlockShared();
+            return e;
+        };
 
-        // Persist CRC for the modified blocks
+        const modify_time = ext.modifyTime();
+        self.extent_lifecycle_lock.unlockShared();
+
+        // Phase 2 (no lifecycle lock): CRC persistence → shard map metadata update
         if (self.crc_persistence) |*cp| {
             if (param.offset >= 0 and param.crc != 0) {
                 const block_no: u32 = @intCast(@as(u64, @intCast(param.offset)) / crc_persist_mod.CRC_BLOCK_SIZE);
@@ -272,9 +297,8 @@ pub const ExtentStore = struct {
             }
         }
 
-        // Update metadata in the shard map.
+        // Update metadata in the shard map (has its own per-shard RwLock).
         const new_size: u64 = @intCast(param.offset + param.size);
-        const modify_time = ext.modifyTime();
         const idx = sharded_map_mod.ShardedMap(u64, ExtentInfo).shardIndex(param.extent_id);
         var shard = &self.extent_info_map.shards[idx];
         shard.lock.lock();
@@ -293,8 +317,8 @@ pub const ExtentStore = struct {
         try self.beginOp();
         defer self.endOp();
 
-        self.extent_lifecycle_lock.lock();
-        defer self.extent_lifecycle_lock.unlock();
+        self.extent_lifecycle_lock.lockShared();  // shared — read path
+        defer self.extent_lifecycle_lock.unlockShared();
 
         if (self.closed.load(.acquire)) {
             return error.ExtentDeleted;
@@ -311,7 +335,7 @@ pub const ExtentStore = struct {
         try self.beginOp();
         defer self.endOp();
 
-        self.extent_lifecycle_lock.lock();
+        self.extent_lifecycle_lock.lock();  // exclusive — lifecycle mutation
         defer self.extent_lifecycle_lock.unlock();
 
         // Update metadata
@@ -445,8 +469,8 @@ pub const ExtentStore = struct {
         try self.beginOp();
         defer self.endOp();
 
-        self.extent_lifecycle_lock.lock();
-        defer self.extent_lifecycle_lock.unlock();
+        self.extent_lifecycle_lock.lockShared();  // shared — flush is read-like
+        defer self.extent_lifecycle_lock.unlockShared();
 
         try self.cache.flushAll();
     }
@@ -456,8 +480,8 @@ pub const ExtentStore = struct {
         try self.beginOp();
         defer self.endOp();
 
-        self.extent_lifecycle_lock.lock();
-        defer self.extent_lifecycle_lock.unlock();
+        self.extent_lifecycle_lock.lockShared();  // shared — read path
+        defer self.extent_lifecycle_lock.unlockShared();
 
         if (self.closed.load(.acquire)) {
             return error.ExtentDeleted;
@@ -481,7 +505,7 @@ pub const ExtentStore = struct {
         try self.beginOp();
         defer self.endOp();
 
-        self.extent_lifecycle_lock.lock();
+        self.extent_lifecycle_lock.lock();  // exclusive — lifecycle mutation
         defer self.extent_lifecycle_lock.unlock();
 
         const ext = try self.getOrOpenExtent(extent_id);
@@ -540,14 +564,16 @@ pub const ExtentStore = struct {
 
     /// Close the store.
     pub fn close(self: *ExtentStore) void {
-        self.op_mu.lock();
         self.closed.store(true, .release);
-        while (self.active_ops != 0) {
+
+        // Wait for in-flight operations to drain.
+        self.op_mu.lock();
+        while (self.active_ops.load(.acquire) != 0) {
             self.op_cv.wait(&self.op_mu);
         }
         self.op_mu.unlock();
 
-        self.extent_lifecycle_lock.lock();
+        self.extent_lifecycle_lock.lock();  // exclusive — closing
         defer self.extent_lifecycle_lock.unlock();
 
         self.cache.clear();
@@ -565,18 +591,34 @@ pub const ExtentStore = struct {
     }
 
     /// Get an extent from cache or open it from disk.
+    /// Fast path (cache hit): no outer lock — cache.get() uses internal shared RwLock.
+    /// Slow path (cache miss): acquires extent_open_mu to prevent duplicate opens,
+    /// then double-checks cache before opening from disk.
     fn getOrOpenExtent(self: *ExtentStore, extent_id: u64) err.Error!*Extent {
-        self.extent_open_mu.lock();
-        defer self.extent_open_mu.unlock();
-
+        // Validate extent exists and is not deleted (shard map has per-shard RwLock).
         const info = self.lookupExtentInfo(extent_id) orelse return error.ExtentNotFound;
         if (info.is_deleted) {
             return error.ExtentDeleted;
         }
 
-        // Try cache first
+        // Fast path: cache hit with no outer lock.
         if (self.cache.get(extent_id)) |ext| {
             return ext;
+        }
+
+        // Slow path: cache miss — lock to prevent duplicate opens.
+        self.extent_open_mu.lock();
+        defer self.extent_open_mu.unlock();
+
+        // Double-check cache after acquiring lock (another thread may have opened it).
+        if (self.cache.get(extent_id)) |ext| {
+            return ext;
+        }
+
+        // Re-check extent info (may have been deleted while we waited for the lock).
+        const current_info = self.lookupExtentInfo(extent_id) orelse return error.ExtentNotFound;
+        if (current_info.is_deleted) {
+            return error.ExtentDeleted;
         }
 
         // Open from disk
@@ -587,12 +629,13 @@ pub const ExtentStore = struct {
 
         const ext = try Extent.open(self.allocator, path, extent_id);
 
-        const current_info = self.lookupExtentInfo(extent_id) orelse {
+        // Final safety check after open (extent could be deleted during disk I/O).
+        const final_info = self.lookupExtentInfo(extent_id) orelse {
             ext.close() catch {};
             ext.destroy();
             return error.ExtentNotFound;
         };
-        if (current_info.is_deleted) {
+        if (final_info.is_deleted) {
             ext.close() catch {};
             ext.destroy();
             return error.ExtentDeleted;

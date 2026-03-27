@@ -8,16 +8,23 @@ const shutdown_mod = @import("shutdown.zig");
 const log = @import("log.zig");
 
 pub fn main() !void {
+    std.debug.print("[zig-datanode] main() entered\n", .{});
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    std.debug.print("[zig-datanode] allocator ready\n", .{});
+
     // Install signal handlers for graceful shutdown
     shutdown_mod.installSignalHandlers();
+    std.debug.print("[zig-datanode] signal handlers installed\n", .{});
 
     // Parse CLI args
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
+
+    std.debug.print("[zig-datanode] args parsed, count={d}\n", .{args.len});
 
     var config_path: ?[]const u8 = null;
     var i: usize = 1;
@@ -39,11 +46,15 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
+    std.debug.print("[zig-datanode] loading config from: {s}\n", .{path});
+
     // Load config
     const config = config_mod.Config.fromFile(allocator, path) catch |e| {
         std.debug.print("error: failed to load config from {s}: {}\n", .{ path, e });
         std.process.exit(1);
     };
+
+    std.debug.print("[zig-datanode] config loaded, ip={s} port={d} disks={d}\n", .{ config.local_ip, config.port, config.disks.len });
 
     // Set log level
     if (std.mem.eql(u8, config.log_level, "debug")) {
@@ -63,6 +74,8 @@ pub fn main() !void {
     if (config.node_id != 0) {
         log.info("  raft:   node_id={d}, heartbeat={d}", .{ config.node_id, config.raft_heartbeat });
     }
+
+    std.debug.print("[zig-datanode] calling server_mod.run()\n", .{});
 
     // Run server (blocks forever)
     server_mod.run(config, allocator) catch |e| {

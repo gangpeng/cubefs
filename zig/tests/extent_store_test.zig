@@ -571,3 +571,216 @@ test "punchDelete appends tiny delete record" {
     try testing.expectEqual(@as(u64, 512), r.offset);
     try testing.expectEqual(@as(u64, 256), r.size);
 }
+
+test "concurrent reads do not block each other" {
+    var buf: [256]u8 = undefined;
+    const dir = makeTempDir(&buf);
+    defer cleanupDir(dir);
+
+    const allocator = testing.allocator;
+    const store = try ExtentStore.create(allocator, dir, 1);
+    defer store.destroy();
+
+    // Create and write 4 extents
+    var eids: [4]u64 = undefined;
+    for (&eids) |*eid| {
+        eid.* = store.nextExtentId();
+        try store.createExtent(eid.*);
+        var data: [1024]u8 = undefined;
+        @memset(&data, 0xAA);
+        const param = types.WriteParam{
+            .extent_id = eid.*,
+            .offset = 0,
+            .size = 1024,
+            .data = &data,
+            .crc = crc32.hash(&data),
+            .write_type = constants.WRITE_TYPE_APPEND,
+            .is_sync = true,
+        };
+        try store.writeExtent(&param);
+    }
+
+    // Warm cache by reading each extent once
+    for (eids) |eid| {
+        var read_buf: [1024]u8 = undefined;
+        _ = try store.readExtent(eid, 0, &read_buf);
+    }
+
+    // Launch 8 threads all reading concurrently
+    const num_threads = 8;
+    const reads_per_thread = 500;
+    var error_count = std.atomic.Value(u32).init(0);
+
+    var threads: [num_threads]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| {
+        const Context = struct {
+            store_ptr: *ExtentStore,
+            extent_ids: [4]u64,
+            thread_idx: usize,
+            err_count: *std.atomic.Value(u32),
+
+            fn run(ctx: @This()) void {
+                var read_buf: [1024]u8 = undefined;
+                var j: usize = 0;
+                while (j < reads_per_thread) : (j += 1) {
+                    const eid = ctx.extent_ids[j % ctx.extent_ids.len];
+                    const result = ctx.store_ptr.readExtent(eid, 0, &read_buf);
+                    if (result) |r| {
+                        if (r.bytes_read != 1024) {
+                            _ = ctx.err_count.fetchAdd(1, .monotonic);
+                        }
+                    } else |_| {
+                        _ = ctx.err_count.fetchAdd(1, .monotonic);
+                    }
+                }
+            }
+        };
+        const ctx = Context{
+            .store_ptr = store,
+            .extent_ids = eids,
+            .thread_idx = i,
+            .err_count = &error_count,
+        };
+        t.* = std.Thread.spawn(.{}, Context.run, .{ctx}) catch unreachable;
+    }
+
+    for (&threads) |*t| t.join();
+
+    try testing.expectEqual(@as(u32, 0), error_count.load(.acquire));
+}
+
+test "concurrent reads and writes to different extents" {
+    var buf: [256]u8 = undefined;
+    const dir = makeTempDir(&buf);
+    defer cleanupDir(dir);
+
+    const allocator = testing.allocator;
+    const store = try ExtentStore.create(allocator, dir, 1);
+    defer store.destroy();
+
+    // Create 2 extents: one for reading, one for writing
+    const read_eid = store.nextExtentId();
+    try store.createExtent(read_eid);
+    var init_data: [1024]u8 = undefined;
+    @memset(&init_data, 0xBB);
+    const init_param = types.WriteParam{
+        .extent_id = read_eid,
+        .offset = 0,
+        .size = 1024,
+        .data = &init_data,
+        .crc = crc32.hash(&init_data),
+        .write_type = constants.WRITE_TYPE_APPEND,
+        .is_sync = true,
+    };
+    try store.writeExtent(&init_param);
+
+    const write_eid = store.nextExtentId();
+    try store.createExtent(write_eid);
+
+    // Warm cache
+    var warm_buf: [1024]u8 = undefined;
+    _ = try store.readExtent(read_eid, 0, &warm_buf);
+
+    var read_errors = std.atomic.Value(u32).init(0);
+    var write_errors = std.atomic.Value(u32).init(0);
+
+    const ReadCtx = struct {
+        store_ptr: *ExtentStore,
+        eid: u64,
+        err_count: *std.atomic.Value(u32),
+
+        fn run(ctx: @This()) void {
+            var read_buf: [1024]u8 = undefined;
+            var i: usize = 0;
+            while (i < 200) : (i += 1) {
+                const result = ctx.store_ptr.readExtent(ctx.eid, 0, &read_buf);
+                if (result) |r| {
+                    if (r.bytes_read != 1024) {
+                        _ = ctx.err_count.fetchAdd(1, .monotonic);
+                    }
+                } else |_| {
+                    _ = ctx.err_count.fetchAdd(1, .monotonic);
+                }
+            }
+        }
+    };
+
+    const WriteCtx = struct {
+        store_ptr: *ExtentStore,
+        eid: u64,
+        err_count: *std.atomic.Value(u32),
+
+        fn run(ctx: @This()) void {
+            var data: [512]u8 = undefined;
+            @memset(&data, 0xCC);
+            var i: usize = 0;
+            while (i < 100) : (i += 1) {
+                const param = types.WriteParam{
+                    .extent_id = ctx.eid,
+                    .offset = @intCast(i * 512),
+                    .size = 512,
+                    .data = &data,
+                    .crc = crc32.hash(&data),
+                    .write_type = constants.WRITE_TYPE_APPEND,
+                    .is_sync = false,
+                };
+                ctx.store_ptr.writeExtent(&param) catch {
+                    _ = ctx.err_count.fetchAdd(1, .monotonic);
+                };
+            }
+        }
+    };
+
+    // 4 reader threads + 2 writer threads
+    var threads: [6]std.Thread = undefined;
+    for (threads[0..4]) |*t| {
+        const ctx = ReadCtx{ .store_ptr = store, .eid = read_eid, .err_count = &read_errors };
+        t.* = std.Thread.spawn(.{}, ReadCtx.run, .{ctx}) catch unreachable;
+    }
+    for (threads[4..6]) |*t| {
+        const ctx = WriteCtx{ .store_ptr = store, .eid = write_eid, .err_count = &write_errors };
+        t.* = std.Thread.spawn(.{}, WriteCtx.run, .{ctx}) catch unreachable;
+    }
+
+    for (&threads) |*t| t.join();
+
+    try testing.expectEqual(@as(u32, 0), read_errors.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), write_errors.load(.acquire));
+}
+
+test "cache miss opens extent correctly with double-check" {
+    var buf: [256]u8 = undefined;
+    const dir = makeTempDir(&buf);
+    defer cleanupDir(dir);
+
+    const allocator = testing.allocator;
+
+    // Create a store, write data, close (evicts from cache), reopen and read
+    const eid: u64 = blk: {
+        const store = try ExtentStore.create(allocator, dir, 1);
+        defer store.destroy();
+
+        const e = store.nextExtentId();
+        try store.createExtent(e);
+        const data = "cache miss test data";
+        const param = types.WriteParam{
+            .extent_id = e,
+            .offset = 0,
+            .size = @intCast(data.len),
+            .data = data,
+            .crc = crc32.hash(data),
+            .write_type = constants.WRITE_TYPE_APPEND,
+            .is_sync = true,
+        };
+        try store.writeExtent(&param);
+        break :blk e;
+    };
+
+    // Reopen store — cache is cold, forces cache-miss path
+    const store2 = try ExtentStore.create(allocator, dir, 1);
+    defer store2.destroy();
+
+    var read_buf: [100]u8 = undefined;
+    const result = try store2.readExtent(eid, 0, &read_buf);
+    try testing.expectEqualStrings("cache miss test data", read_buf[0..result.bytes_read]);
+}

@@ -24,7 +24,7 @@ const ReplicationPipeline = replication_mod.ReplicationPipeline;
 const ServerInner = handler_mod.ServerInner;
 const RaftServer = raft_server_mod.RaftServer;
 
-const SEND_BUFFER_SIZE: u32 = 1024 * 1024; // 1 MB
+const SEND_BUFFER_SIZE: u32 = 2 * 1024 * 1024; // 2 MB — must exceed max response size (1 MB reads)
 const HEARTBEAT_INTERVAL_NS: u64 = 10 * std.time.ns_per_s;
 
 /// Context passed to background threads that need server state.
@@ -40,16 +40,20 @@ const HeartbeatContext = struct {
 
 /// Main server entry point. Runs until process termination.
 pub fn run(config: Config, allocator: Allocator) !void {
+    std.debug.print("[server] run() entered\n", .{});
     const start_time = std.time.timestamp();
 
     // Initialize space manager
     var space_mgr = SpaceManager.init(allocator);
+    std.debug.print("[server] space_mgr initialized\n", .{});
 
     // Initialize disks
     const disk_entries = try config.parseDiskEntries(allocator);
     defer allocator.free(disk_entries);
+    std.debug.print("[server] parsed {d} disk entries\n", .{disk_entries.len});
 
     for (disk_entries) |entry| {
+        std.debug.print("[server] initializing disk: {s}\n", .{entry.path});
         const d = Disk.init(allocator, entry.path, entry.reserved_space, 0, 0) catch |e| {
             log.err("failed to initialize disk {s}: {}", .{ entry.path, e });
             continue;
@@ -72,9 +76,11 @@ pub fn run(config: Config, allocator: Allocator) !void {
         config.raft_heartbeat,
         config.raft_replica,
     );
+    std.debug.print("[server] master_client initialized\n", .{});
 
     // Initialize replication pipeline
     var replication = ReplicationPipeline.init(allocator);
+    std.debug.print("[server] replication initialized\n", .{});
 
     // Initialize Raft server (only if node_id is configured)
     var raft_server: ?*RaftServer = null;
@@ -153,12 +159,14 @@ pub fn run(config: Config, allocator: Allocator) !void {
     };
 
     // TCP accept loop
+    std.debug.print("[server] binding to {s}:{d}\n", .{ config.local_ip, config.port });
     const address = try net.Address.parseIp4(config.local_ip, config.port);
     var tcp_server = try address.listen(.{
         .reuse_address = true,
     });
     defer tcp_server.deinit();
 
+    std.debug.print("[server] listening, entering accept loop\n", .{});
     log.info("datanode listening on {s}:{d}", .{ config.local_ip, config.port });
 
     while (true) {
@@ -170,7 +178,8 @@ pub fn run(config: Config, allocator: Allocator) !void {
         // Set TCP_NODELAY
         setNoDelay(conn.stream) catch {};
 
-        // Set send buffer size
+        // Set send buffer size (2 MB) — must exceed max response to avoid
+        // writev blocking on send buffer drain for 1 MB read responses.
         setSendBuf(conn.stream, SEND_BUFFER_SIZE) catch {};
 
         // Spawn connection handler thread

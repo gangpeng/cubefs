@@ -19,6 +19,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     lib.linkLibC();
+    lib.linkSystemLibrary("z");
     b.installArtifact(lib);
 
     // Static library: libcubefs_engine.a
@@ -29,6 +30,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     static_lib.linkLibC();
+    static_lib.linkSystemLibrary("z");
     b.installArtifact(static_lib);
 
     // Install the C header
@@ -49,6 +51,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     datanode_exe.linkLibC();
+    datanode_exe.linkSystemLibrary("z");
     b.installArtifact(datanode_exe);
 
     // ── Live E2E test binary ──────────────────────────────────────
@@ -59,6 +62,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     e2e_exe.linkLibC();
+    e2e_exe.linkSystemLibrary("z");
     b.installArtifact(e2e_exe);
 
     const e2e_repl_exe = b.addExecutable(.{
@@ -68,6 +72,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     e2e_repl_exe.linkLibC();
+    e2e_repl_exe.linkSystemLibrary("z");
     b.installArtifact(e2e_repl_exe);
 
     // ── Tests ─────────────────────────────────────────────────────
@@ -79,6 +84,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     main_tests.linkLibC();
+    main_tests.linkSystemLibrary("z");
 
     const run_main_tests = b.addRunArtifact(main_tests);
     const test_step = b.step("test", "Run unit tests");
@@ -104,6 +110,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         t.linkLibC();
+        t.linkSystemLibrary("z");
         t.root_module.addImport("cubefs_engine", engine_mod);
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);
@@ -144,6 +151,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         t.linkLibC();
+        t.linkSystemLibrary("z");
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);
     }
@@ -156,6 +164,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         t.linkLibC();
+        t.linkSystemLibrary("z");
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);
     }
@@ -168,6 +177,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         t.linkLibC();
+        t.linkSystemLibrary("z");
         const run_t = b.addRunArtifact(t);
         const functest_step = b.step("functest", "Run functional tests");
         functest_step.dependOn(&run_t.step);
@@ -183,6 +193,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast, // Always optimize benchmarks
         });
         bench_exe.linkLibC();
+        bench_exe.linkSystemLibrary("z");
         bench_exe.root_module.addImport("cubefs_engine", engine_mod);
         b.installArtifact(bench_exe);
 
@@ -200,6 +211,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         });
         net_bench_exe.linkLibC();
+        net_bench_exe.linkSystemLibrary("z");
         net_bench_exe.root_module.addImport("cubefs_engine", engine_mod);
         b.installArtifact(net_bench_exe);
 

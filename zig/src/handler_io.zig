@@ -12,7 +12,13 @@ const partition_mod = @import("partition.zig");
 const json_mod = @import("json.zig");
 const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
+const buffer_pool_mod = @import("buffer_pool.zig");
+const BufferPool = buffer_pool_mod.BufferPool;
 const DataPartition = partition_mod.DataPartition;
+
+/// Module-level buffer pool for read operations.
+/// Avoids per-read heap allocation by recycling size-bucketed buffers.
+var read_buffer_pool = BufferPool.init(std.heap.page_allocator);
 
 /// Handle OpCreateExtent
 pub fn handleCreateExtent(pkt: *const Packet, dp: *DataPartition, allocator: Allocator) Packet {
@@ -75,7 +81,8 @@ fn doWrite(pkt: *const Packet, dp: *DataPartition, write_type: i32, is_sync: boo
 
     var reply = Packet.okReply(pkt);
     reply.crc = pkt.crc;
-    reply.size = pkt.size;
+    // size must be 0 in write responses: the Go client's ReadFromConnWithVer
+    // reads Size bytes of data from the wire, and no data follows in a write reply.
     return reply;
 }
 
@@ -87,15 +94,16 @@ pub fn handleRead(pkt: *const Packet, dp: *DataPartition, allocator: Allocator) 
     // Rate-limit reads
     dp.disk.acquireRead();
 
-    const buf = allocator.alloc(u8, read_size) catch {
+    const pool_buf = read_buffer_pool.getBuffer(read_size) catch {
         return Packet.errReply(pkt, proto.OP_ERR);
     };
+    const buf = pool_buf[0..read_size];
 
     const start_ns = std.time.nanoTimestamp();
 
     const offset: u64 = if (pkt.extent_offset >= 0) @intCast(pkt.extent_offset) else 0;
     const result = dp.store.readExtent(pkt.extent_id, offset, buf) catch |e| {
-        allocator.free(buf);
+        read_buffer_pool.putBuffer(pool_buf);
         metrics_mod.global.recordError(true);
         return errorPacket(pkt, e);
     };
@@ -106,7 +114,8 @@ pub fn handleRead(pkt: *const Packet, dp: *DataPartition, allocator: Allocator) 
 
     var reply = Packet.okReply(pkt);
     reply.data = buf[0..result.bytes_read];
-    reply.data_owned = true;
+    reply.pool = &read_buffer_pool;
+    reply.pool_buf = pool_buf;
     reply.allocator = allocator;
     reply.size = @intCast(result.bytes_read);
     reply.crc = result.crc;
@@ -121,13 +130,14 @@ pub fn handleStreamRead(pkt: *const Packet, dp: *DataPartition, allocator: Alloc
     // Rate-limit reads
     dp.disk.acquireRead();
 
-    const buf = allocator.alloc(u8, read_size) catch {
+    const pool_buf = read_buffer_pool.getBuffer(read_size) catch {
         return Packet.errReply(pkt, proto.OP_ERR);
     };
+    const buf = pool_buf[0..read_size];
 
     const offset: u64 = if (pkt.extent_offset >= 0) @intCast(pkt.extent_offset) else 0;
     const n = dp.store.readNoCrc(pkt.extent_id, offset, buf) catch |e| {
-        allocator.free(buf);
+        read_buffer_pool.putBuffer(pool_buf);
         return errorPacket(pkt, e);
     };
 
@@ -136,7 +146,8 @@ pub fn handleStreamRead(pkt: *const Packet, dp: *DataPartition, allocator: Alloc
 
     var reply = Packet.okReply(pkt);
     reply.data = buf[0..n];
-    reply.data_owned = true;
+    reply.pool = &read_buffer_pool;
+    reply.pool_buf = pool_buf;
     reply.allocator = allocator;
     reply.size = @intCast(n);
     reply.crc = crc;
@@ -300,13 +311,14 @@ pub fn handleExtentRepairRead(pkt: *const Packet, dp: *DataPartition, allocator:
     const read_size = pkt.size;
     if (read_size == 0) return Packet.okReply(pkt);
 
-    const buf = allocator.alloc(u8, read_size) catch {
+    const pool_buf = read_buffer_pool.getBuffer(read_size) catch {
         return Packet.errReply(pkt, proto.OP_ERR);
     };
+    const buf = pool_buf[0..read_size];
 
     const offset: u64 = if (pkt.extent_offset >= 0) @intCast(pkt.extent_offset) else 0;
     const n = dp.store.readNoCrc(pkt.extent_id, offset, buf) catch |e| {
-        allocator.free(buf);
+        read_buffer_pool.putBuffer(pool_buf);
         return errorPacket(pkt, e);
     };
 
@@ -314,7 +326,8 @@ pub fn handleExtentRepairRead(pkt: *const Packet, dp: *DataPartition, allocator:
 
     var reply = Packet.okReply(pkt);
     reply.data = buf[0..n];
-    reply.data_owned = true;
+    reply.pool = &read_buffer_pool;
+    reply.pool_buf = pool_buf;
     reply.allocator = allocator;
     reply.size = @intCast(n);
     reply.crc = crc;

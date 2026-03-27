@@ -261,7 +261,6 @@ fn forwardToFollower(
     // Get or create connection
     const stream = pool.get(addr) catch return false;
 
-    const writer = stream.writer();
     const reader = stream.reader();
 
     // Build forwarded packet
@@ -299,7 +298,7 @@ fn forwardToFollower(
     }
 
     // Send
-    codec.writePacket(writer, &fwd) catch {
+    codec.writePacketFd(stream.handle, &fwd) catch {
         stream.close();
         return false;
     };

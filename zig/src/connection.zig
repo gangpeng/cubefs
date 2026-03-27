@@ -93,7 +93,6 @@ pub fn handleConnectionTimeout(stream: net.Stream, server: *ServerInner, allocat
     defer _ = active_connections.fetchSub(1, .release);
 
     const reader = stream.reader();
-    const writer = stream.writer();
 
     while (true) {
         // Read one packet
@@ -115,8 +114,8 @@ pub fn handleConnectionTimeout(stream: net.Stream, server: *ServerInner, allocat
         var reply = server.dispatch(&pkt);
         defer reply.deinit();
 
-        // Write response
-        codec.writePacket(writer, &reply) catch |e| {
+        // Write response using writev (scatter-gather) for fewer syscalls.
+        codec.writePacketFd(stream.handle, &reply) catch |e| {
             switch (e) {
                 error.ConnectionClosed => {},
                 else => log.warn("write error: {}, closing connection", .{e}),

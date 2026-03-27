@@ -4,6 +4,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const proto = @import("protocol.zig");
+const buffer_pool_mod = @import("buffer_pool.zig");
+const BufferPool = buffer_pool_mod.BufferPool;
 
 /// A CubeFS wire packet. Owns `arg` and `data` slices (caller must free via deinit).
 pub const Packet = struct {
@@ -30,11 +32,26 @@ pub const Packet = struct {
     allocator: ?Allocator = null,
     arg_owned: bool = false,
     data_owned: bool = false,
+    /// Buffer pool that owns pool_buf (if set, putBuffer on deinit instead of free).
+    pool: ?*BufferPool = null,
+    /// Full pool buffer to return (may be larger than data slice).
+    pool_buf: ?[]u8 = null,
 
     pub fn deinit(self: *Packet) void {
+        if (self.pool) |p| {
+            if (self.pool_buf) |buf| {
+                p.putBuffer(buf);
+            }
+            self.pool = null;
+            self.pool_buf = null;
+            // data pointed into pool_buf, don't double-free
+            self.data = &.{};
+            self.data_owned = false;
+        } else if (self.allocator) |alloc| {
+            if (self.data_owned and self.data.len > 0) alloc.free(@constCast(self.data));
+        }
         if (self.allocator) |alloc| {
             if (self.arg_owned and self.arg.len > 0) alloc.free(@constCast(self.arg));
-            if (self.data_owned and self.data.len > 0) alloc.free(@constCast(self.data));
         }
         self.arg = &.{};
         self.data = &.{};
